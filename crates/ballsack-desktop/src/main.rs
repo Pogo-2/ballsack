@@ -26,6 +26,8 @@ pub fn run() {
             commands::end_call,
             commands::get_peers,
             commands::get_stats,
+            commands::set_muted,
+            commands::list_audio_devices,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

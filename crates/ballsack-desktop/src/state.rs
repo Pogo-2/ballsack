@@ -1,12 +1,13 @@
 //! Managed Tauri state — holds Arc-wrapped adapters and use cases from ballsack-core.
 
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
 use ballsack_core::adapters::crypto::e2ee::InMemoryE2eeKeystore;
 use ballsack_core::adapters::crypto::identity::IdentityKeyPair;
-use ballsack_core::adapters::media::audio::{AudioCaptureSource, AudioPlaybackAdapter};
+use ballsack_core::adapters::media::audio::{CpalAudioCapture, CpalAudioPlayback};
 use ballsack_core::adapters::media::video::VideoPlaybackAdapter;
 use ballsack_core::adapters::playback::CombinedPlayback;
 use ballsack_core::adapters::quic::client::QuicClientTransport;
@@ -32,6 +33,17 @@ pub struct CallSession {
     pub transport: Arc<dyn Transport>,
     pub keystore: Arc<dyn E2eeKeystore>,
     pub room_state: Arc<dyn RoomState>,
+    /// Mute flag for the microphone (shared with the capture task).
+    pub mute_flag: Arc<AtomicBool>,
+    /// Audio playback handle — stopped on drop.
+    pub audio_playback: Arc<CpalAudioPlayback>,
+}
+
+impl Drop for CallSession {
+    fn drop(&mut self) {
+        // Stop the playout loop so it doesn't leak across sessions.
+        self.audio_playback.stop();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +77,7 @@ pub async fn build_call_session(
     display_name: String,
     token: String,
     app_events: Arc<dyn AppEvents>,
+    input_device: Option<String>,
 ) -> anyhow::Result<CallSession> {
     // Adapters
     let identity = IdentityKeyPair::generate();
@@ -120,8 +133,10 @@ pub async fn build_call_session(
         }
     });
 
-    // Media receiver
-    let audio_playback = Arc::new(AudioPlaybackAdapter::new(3));
+    // Media receiver — real audio playback via cpal + Opus decoding
+    let audio_playback = Arc::new(CpalAudioPlayback::new(5)?);
+    audio_playback.start(); // spawns the 20ms playout mixer loop
+    let audio_pb_handle = audio_playback.clone(); // kept in CallSession for stop-on-drop
     let video_playback = Arc::new(VideoPlaybackAdapter::new(10));
     let combined_playback = Arc::new(CombinedPlayback {
         audio: audio_playback,
@@ -152,6 +167,10 @@ pub async fn build_call_session(
         }
     });
 
+    // Real audio capture from microphone via cpal + Opus encoding
+    let mut audio_capture = CpalAudioCapture::with_device(input_device.as_deref())?;
+    let mute_flag = audio_capture.mute_handle();
+
     // Audio send loop (reads key from shared_key on each frame)
     let send_media = Arc::new(SendMediaUseCase::new(
         transport.clone(),
@@ -164,7 +183,6 @@ pub async fn build_call_session(
     let sm = send_media.clone();
     let sk = shared_key.clone();
     tokio::spawn(async move {
-        let mut audio_capture = AudioCaptureSource::new();
         if let Err(e) = sm.run(&mut audio_capture, sk).await {
             tracing::error!("Audio send loop exited: {e}");
         }
@@ -177,5 +195,7 @@ pub async fn build_call_session(
         transport,
         keystore,
         room_state,
+        mute_flag,
+        audio_playback: audio_pb_handle,
     })
 }

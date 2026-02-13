@@ -6,6 +6,7 @@ use serde::Serialize;
 use tauri::AppHandle;
 use tracing::info;
 
+use ballsack_core::adapters::media::audio::{enumerate_input_devices, AudioDeviceInfo};
 use ballsack_core::domain::identity::RoomId;
 
 use crate::events::TauriAppEvents;
@@ -40,8 +41,9 @@ pub async fn start_call(
     state: tauri::State<'_, AppState>,
     room_id: u64,
     display_name: String,
+    input_device: Option<String>,
 ) -> Result<StartCallResult, String> {
-    info!(room_id, %display_name, "start_call invoked");
+    info!(room_id, %display_name, ?input_device, "start_call invoked");
 
     let app_events: Arc<dyn ballsack_core::application::ports::AppEvents> =
         Arc::new(TauriAppEvents::new(app.clone()));
@@ -56,6 +58,7 @@ pub async fn start_call(
         display_name,
         "dev-token".into(),
         app_events,
+        input_device,
     )
     .await
     .map_err(|e| format!("Failed to start call: {e}"))?;
@@ -110,6 +113,31 @@ pub async fn get_peers(
         }
         None => Ok(vec![]),
     }
+}
+
+/// Set the microphone mute state.
+#[tauri::command]
+pub async fn set_muted(
+    state: tauri::State<'_, AppState>,
+    muted: bool,
+) -> Result<bool, String> {
+    let guard = state.session.lock().await;
+    match guard.as_ref() {
+        Some(session) => {
+            session
+                .mute_flag
+                .store(muted, std::sync::atomic::Ordering::Relaxed);
+            info!(muted, "Microphone mute toggled");
+            Ok(muted)
+        }
+        None => Err("Not in a call".into()),
+    }
+}
+
+/// List available audio input devices.
+#[tauri::command]
+pub async fn list_audio_devices() -> Result<Vec<AudioDeviceInfo>, String> {
+    Ok(enumerate_input_devices())
 }
 
 /// Get the current call stats (placeholder — real stats will come from transport metrics).

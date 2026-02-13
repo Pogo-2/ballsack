@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 futures = "0.3"
 
 # QUIC (use ring crypto backend to avoid aws-lc-sys C compilation)
@@ -39,3 +40,12 @@ anyhow = "1"
 
 # Async trait (still useful for dyn dispatch)
 async-trait = "0.1"
+
+# Audio I/O
+cpal = "0.17"
+
+# Opus codec (FFI to libopus — requires C compiler / MSVC on Windows)
+audiopus = "0.2"
+
+# Lock-free SPSC ring buffer (bridge cpal callbacks <-> async tasks)
+ringbuf = "0.4"

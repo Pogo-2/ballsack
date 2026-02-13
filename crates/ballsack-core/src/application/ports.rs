@@ -121,7 +121,7 @@ pub trait E2eeKeystore: Send + Sync {
 
 /// Produces encoded audio/video frames from capture devices.
 #[async_trait]
-pub trait MediaCapture: Send + Sync {
+pub trait MediaCapture: Send {
     /// Grab the next encoded frame. Returns (payload_bytes, is_audio).
     async fn next_frame(&mut self) -> anyhow::Result<CapturedFrame>;
 }
