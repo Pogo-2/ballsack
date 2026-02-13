@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/ballsack-core",
+  "crates/ballsack-server",
+  "crates/ballsack-desktop",
+]

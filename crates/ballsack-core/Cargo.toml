@@ -1,0 +1,41 @@
+[package]
+name = "ballsack-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+
+# QUIC (use ring crypto backend to avoid aws-lc-sys C compilation)
+quinn = { version = "0.11", default-features = false, features = ["platform-verifier", "rustls-ring", "runtime-tokio", "log"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rcgen = "0.13"
+
+# Serialization (CBOR for control messages)
+serde = { version = "1", features = ["derive"] }
+serde_cbor = "0.11"
+bytes = "1"
+
+# Crypto - identity
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# Crypto - key agreement
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+# Crypto - AEAD media encryption
+chacha20poly1305 = "0.10"
+# Crypto - hashing (nonce derivation, fingerprints)
+sha2 = "0.10"
+# Crypto - RNG
+rand = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Async trait (still useful for dyn dispatch)
+async-trait = "0.1"

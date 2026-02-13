@@ -1,0 +1,27 @@
+# Build artifacts
+/target
+
+# Node
+node_modules/
+dist/
+
+# Logs
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Editor / IDE
+*.swp
+*.swo
+.idea/
+.vscode/
+*.iml
+
+# Environment / secrets
+.env
+.env.*
+*.pem
+*.key

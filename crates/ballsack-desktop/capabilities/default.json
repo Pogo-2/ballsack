@@ -1,0 +1,12 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegram/nicegram-ios/refs/heads/main/.tauri/capabilities-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for the ballsack desktop app",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:event:allow-emit",
+    "core:event:allow-listen"
+  ]
+}

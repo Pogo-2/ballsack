@@ -1,0 +1,15 @@
+[package]
+name = "ballsack-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ballsack-server"
+path = "src/main.rs"
+
+[dependencies]
+ballsack-core = { path = "../ballsack-core" }
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
