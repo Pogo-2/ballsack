@@ -37,8 +37,9 @@ use super::clock::AUDIO_FRAME_TICKS;
 const OPUS_SAMPLE_RATE: u32 = 48_000;
 /// Opus frame size in samples at 48 kHz (20 ms).
 const OPUS_FRAME_SAMPLES: usize = 960;
-/// Opus encoding bitrate (bits/sec).
-const OPUS_BITRATE: i32 = 32_000;
+/// Opus encoding bitrate (bits/sec).  64 kbps gives clear voice quality
+/// while staying well within typical LAN/internet bandwidth budgets.
+const OPUS_BITRATE: i32 = 64_000;
 
 // ---------------------------------------------------------------------------
 // Device enumeration
@@ -255,6 +256,13 @@ impl CpalAudioCapture {
             Application::Voip,
         )?;
         let _ = encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(OPUS_BITRATE));
+        // Tell Opus the input is voice — enables built-in voice-specific optimisations.
+        let _ = encoder.set_signal(audiopus::Signal::Voice);
+        // Max encoder complexity (10) — better quality at slight CPU cost (negligible for mono voice).
+        let _ = encoder.set_complexity(10);
+        // Enable in-band Forward Error Correction so the decoder can partially
+        // recover lost packets from subsequent ones.
+        let _ = encoder.set_inband_fec(true);
 
         let device_frame_samples = (device_sample_rate as usize) / 50; // 20 ms
         let muted = Arc::new(AtomicBool::new(false));
@@ -392,20 +400,33 @@ impl MediaCapture for SilenceCaptureSource {
 // ---------------------------------------------------------------------------
 
 /// Per-sender, per-ssrc audio jitter buffer.
+///
+/// Operates in two phases:
+/// 1. **Buffering** — accumulate `min_depth` frames before starting playout
+///    so we have a cushion to absorb network jitter.
+/// 2. **Playout** — deliver frames in sequence order at a steady 20 ms pace.
+///
+/// Reverts to Buffering after the buffer drains completely.
 struct AudioJitterBuffer {
     buffer: BTreeMap<u16, Vec<u8>>,
     next_playout_seq: Option<u16>,
     max_frames: usize,
+    /// Minimum frames to accumulate before starting playout.
+    min_depth: usize,
+    /// `true` while we are still filling up to `min_depth`.
+    buffering: bool,
     /// Ticks since the last successfully decoded frame.
     idle_ticks: u32,
 }
 
 impl AudioJitterBuffer {
-    fn new(max_frames: usize) -> Self {
+    fn new(max_frames: usize, min_depth: usize) -> Self {
         Self {
             buffer: BTreeMap::new(),
             next_playout_seq: None,
             max_frames,
+            min_depth: min_depth.max(1),
+            buffering: true,
             idle_ticks: 0,
         }
     }
@@ -420,25 +441,31 @@ impl AudioJitterBuffer {
     }
 
     fn pull(&mut self) -> Option<Vec<u8>> {
-        // Nothing buffered → don't advance, just count idle ticks.
+        // Nothing buffered → don't advance, stay in / return to buffering.
         if self.buffer.is_empty() {
             self.idle_ticks += 1;
+            self.buffering = true;
+            self.next_playout_seq = None;
             return None;
+        }
+
+        // Still filling up — wait until we have enough frames.
+        if self.buffering {
+            if self.buffer.len() < self.min_depth {
+                return None; // don't advance, don't count idle
+            }
+            // Enough frames accumulated — switch to playout.
+            self.buffering = false;
+            self.next_playout_seq = None; // will be synced below
         }
 
         let earliest = *self.buffer.keys().next().unwrap();
 
-        // First frame ever, or buffer was empty and new data arrived → sync.
+        // Sync playout pointer to the buffer on first pull or after resync.
         let seq = match self.next_playout_seq {
-            None => {
-                // First pull after creation — start at earliest buffered frame.
-                earliest
-            }
+            None => earliest,
             Some(nps) => {
-                // Check if next_playout_seq is behind the buffer (e.g. after a
-                // gap or reconnect).  Use the standard "serial number arithmetic"
-                // comparison: if earliest is ahead of nps by up to 32767 we're
-                // behind and should skip forward.
+                // If next_playout_seq fell behind the buffer, skip forward.
                 let diff = earliest.wrapping_sub(nps);
                 if diff > 0 && diff < 32768 {
                     earliest
@@ -598,13 +625,18 @@ impl CpalAudioPlayback {
         let mut frames_pushed: u64 = 0;
         let diag_interval = 250; // ticks = 250 × 20 ms = 5 s
 
+        // Use interval (not sleep) for consistent pacing — interval accounts
+        // for the time spent in each iteration, while sleep would add drift.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => {
                     info!("Audio playout loop stopped (cancelled)");
                     return;
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(20)) => {}
+                _ = ticker.tick() => {}
             }
             tick_count += 1;
 
@@ -714,7 +746,11 @@ impl CpalAudioPlayback {
     ) -> &'a mut AudioJitterBuffer {
         buffers
             .entry((peer_id.0, ssrc))
-            .or_insert_with(|| AudioJitterBuffer::new(max_frames))
+            .or_insert_with(|| {
+                // min_depth=3 → buffer 60 ms before starting playout,
+                // enough to absorb typical LAN / localhost jitter.
+                AudioJitterBuffer::new(max_frames, 3)
+            })
     }
 }
 

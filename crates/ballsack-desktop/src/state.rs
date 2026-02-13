@@ -134,7 +134,7 @@ pub async fn build_call_session(
     });
 
     // Media receiver — real audio playback via cpal + Opus decoding
-    let audio_playback = Arc::new(CpalAudioPlayback::new(5)?);
+    let audio_playback = Arc::new(CpalAudioPlayback::new(10)?);
     audio_playback.start(); // spawns the 20ms playout mixer loop
     let audio_pb_handle = audio_playback.clone(); // kept in CallSession for stop-on-drop
     let video_playback = Arc::new(VideoPlaybackAdapter::new(10));
