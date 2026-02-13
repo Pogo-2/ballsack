@@ -104,6 +104,10 @@ impl Transport for QuicClientTransport {
         let data = self.connection.read_datagram().await?;
         Ok(data)
     }
+
+    fn rtt(&self) -> Option<std::time::Duration> {
+        Some(self.connection.stats().path.rtt)
+    }
 }
 
 // ---------------------------------------------------------------------------

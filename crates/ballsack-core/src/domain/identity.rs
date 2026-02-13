@@ -66,3 +66,7 @@ pub struct PeerInfo {
 /// Thread-safe shared holder for the current sender key.
 /// Updated when keys rotate; read by the media send loop on every frame.
 pub type SharedSenderKey = std::sync::Arc<tokio::sync::RwLock<(SenderKeyId, SenderSecret)>>;
+
+/// Shared target bitrate in bits/sec, readable by the encoder, writable by the
+/// bitrate adaptation controller.
+pub type SharedBitrateTarget = std::sync::Arc<std::sync::atomic::AtomicI32>;

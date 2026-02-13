@@ -9,7 +9,7 @@
 //! - [`enumerate_input_devices`]: lists available input devices for a picker UI.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
@@ -25,6 +25,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, trace, warn};
 
 use crate::application::ports::{CapturedFrame, MediaCapture, MediaPlayback};
+use crate::domain::control::ControlMsg;
 use crate::domain::identity::PeerId;
 
 use super::clock::AUDIO_FRAME_TICKS;
@@ -183,6 +184,10 @@ pub struct CpalAudioCapture {
     device_frame_samples: usize,
     /// Keep the stream alive (dropped = stream stops).
     _stream: cpal::Stream,
+    /// Shared target bitrate — written by the bitrate adapter, read each frame.
+    target_bitrate: Option<Arc<AtomicI32>>,
+    /// Last applied bitrate, to avoid redundant set_bitrate calls.
+    current_bitrate: i32,
 }
 
 // SAFETY: CpalAudioCapture is only ever accessed via `&mut self`
@@ -275,6 +280,8 @@ impl CpalAudioCapture {
             device_sample_rate,
             device_frame_samples,
             _stream: stream,
+            target_bitrate: None,
+            current_bitrate: OPUS_BITRATE,
         })
     }
 
@@ -282,11 +289,32 @@ impl CpalAudioCapture {
     pub fn mute_handle(&self) -> Arc<AtomicBool> {
         self.muted.clone()
     }
+
+    /// Attach a shared bitrate target for dynamic adaptation.
+    pub fn set_bitrate_target(&mut self, target: Arc<AtomicI32>) {
+        self.target_bitrate = Some(target);
+    }
 }
 
 #[async_trait]
 impl MediaCapture for CpalAudioCapture {
     async fn next_frame(&mut self) -> anyhow::Result<CapturedFrame> {
+        // Dynamically adapt encoder bitrate if a shared target is set.
+        if let Some(ref target) = self.target_bitrate {
+            let desired = target.load(Ordering::Relaxed);
+            if desired != self.current_bitrate {
+                let _ = self
+                    .encoder
+                    .set_bitrate(audiopus::Bitrate::BitsPerSecond(desired));
+                info!(
+                    old = self.current_bitrate,
+                    new = desired,
+                    "Opus bitrate adapted"
+                );
+                self.current_bitrate = desired;
+            }
+        }
+
         // Wait until we have a full frame at the device's native rate.
         loop {
             if self.consumer.occupied_len() >= self.device_frame_samples {
@@ -520,6 +548,10 @@ pub struct CpalAudioPlayback {
     _stream: cpal::Stream,
     /// Cancellation token — cancelled when `stop()` is called.
     cancel: CancellationToken,
+    /// Optional transport for sending ReceiverReport messages.
+    transport: Mutex<Option<Arc<dyn crate::application::ports::Transport>>>,
+    /// Our own peer id (needed as the "reporter" in receiver reports).
+    our_peer_id: Mutex<Option<PeerId>>,
 }
 
 // SAFETY: All mutable state is behind tokio::sync::Mutex.
@@ -595,6 +627,8 @@ impl CpalAudioPlayback {
             device_channels,
             _stream: stream,
             cancel: CancellationToken::new(),
+            transport: Mutex::new(None),
+            our_peer_id: Mutex::new(None),
         })
     }
 
@@ -613,21 +647,42 @@ impl CpalAudioPlayback {
         debug!("Audio playout loop stop requested");
     }
 
+    /// Attach a transport so the playout loop can send `ReceiverReport` messages.
+    pub async fn set_transport(
+        &self,
+        transport: Arc<dyn crate::application::ports::Transport>,
+        our_peer_id: PeerId,
+    ) {
+        *self.transport.lock().await = Some(transport);
+        *self.our_peer_id.lock().await = Some(our_peer_id);
+    }
+
     /// Internal mixer loop: pull from jitter buffers → decode → mix → resample → output ring.
+    ///
+    /// Uses wall-clock elapsed time to decide how many 20 ms frames to decode
+    /// per wakeup.  On Windows the default timer resolution is ~15.6 ms so
+    /// `tokio::time::interval(20ms)` actually fires every ~31 ms.  By decoding
+    /// multiple frames per wakeup we compensate and keep the ring buffer fed
+    /// at the correct rate.
     async fn playout_loop(&self) {
         let mut mix_buf = vec![0.0f32; OPUS_FRAME_SAMPLES];
         let mut decode_buf = vec![0i16; OPUS_FRAME_SAMPLES];
 
-        // Diagnostic counters — logged every 5 seconds.
-        let mut tick_count: u64 = 0;
+        // Diagnostic counters — logged every ~5 seconds (250 frames).
         let mut frames_decoded: u64 = 0;
         let mut frames_missed: u64 = 0;
         let mut frames_pushed: u64 = 0;
-        let diag_interval = 250; // ticks = 250 × 20 ms = 5 s
+        let mut diag_decoded: u64 = 0;
 
-        // Use interval (not sleep) for consistent pacing — interval accounts
-        // for the time spent in each iteration, while sleep would add drift.
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
+        let start = tokio::time::Instant::now();
+        // How many 20 ms frames should have been consumed by now.
+        let mut frames_due: u64;
+        // How many frames we have actually pushed to the ring.
+        let mut frames_produced: u64 = 0;
+
+        // Wake up every ~5 ms (Windows will round to ~15.6 ms, but that's OK —
+        // we decode however many frames are due since the last wake).
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(5));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
@@ -638,50 +693,85 @@ impl CpalAudioPlayback {
                 }
                 _ = ticker.tick() => {}
             }
-            tick_count += 1;
 
-            mix_buf.fill(0.0);
-            let mut peer_count = 0u32;
+            // How many total 20 ms frames should have played out by now?
+            let elapsed_ms = start.elapsed().as_millis() as u64;
+            frames_due = elapsed_ms / 20;
+
+            // Decode as many frames as needed to catch up.
+            let frames_needed = frames_due.saturating_sub(frames_produced);
+            if frames_needed == 0 {
+                continue;
+            }
 
             let mut buffers = self.buffers.lock().await;
             let mut decoders = self.decoders.lock().await;
 
-            for (&(peer_id, _ssrc), jitter) in buffers.iter_mut() {
-                let opus_data = jitter.pull();
+            for _ in 0..frames_needed {
+                mix_buf.fill(0.0);
+                let mut peer_count = 0u32;
 
-                // If the jitter buffer has no frame for this tick, just skip
-                // the peer (output silence).  We intentionally avoid Opus PLC
-                // here because on Windows the tokio 20 ms timer is imprecise
-                // (~15.6 ms resolution) so the playout loop frequently runs
-                // ahead of arriving frames, and PLC generates audible non-
-                // silent "concealment" audio that creates a pulsing artifact.
-                let Some(ref data) = opus_data else {
-                    frames_missed += 1;
-                    continue;
-                };
+                for (&(peer_id, _ssrc), jitter) in buffers.iter_mut() {
+                    let opus_data = jitter.pull();
 
-                let decoder = decoders.entry(peer_id).or_insert_with(|| {
-                    OpusDecoder::new(OpusSampleRate::Hz48000, Channels::Mono)
-                        .expect("Failed to create Opus decoder")
-                });
-
-                let decoded_samples =
-                    match decoder.decode(Some(data.as_slice()), &mut decode_buf[..], false) {
-                        Ok(n) => n,
-                        Err(e) => {
-                            warn!(?peer_id, "Opus decode error: {e}");
-                            0
-                        }
+                    let Some(ref data) = opus_data else {
+                        frames_missed += 1;
+                        continue;
                     };
 
-                if decoded_samples > 0 {
-                    peer_count += 1;
-                    frames_decoded += 1;
-                    let samples = decoded_samples.min(OPUS_FRAME_SAMPLES);
-                    for i in 0..samples {
-                        mix_buf[i] += decode_buf[i] as f32 / i16::MAX as f32;
+                    let decoder = decoders.entry(peer_id).or_insert_with(|| {
+                        OpusDecoder::new(OpusSampleRate::Hz48000, Channels::Mono)
+                            .expect("Failed to create Opus decoder")
+                    });
+
+                    let decoded_samples =
+                        match decoder.decode(Some(data.as_slice()), &mut decode_buf[..], false) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                warn!(?peer_id, "Opus decode error: {e}");
+                                0
+                            }
+                        };
+
+                    if decoded_samples > 0 {
+                        peer_count += 1;
+                        frames_decoded += 1;
+                        let samples = decoded_samples.min(OPUS_FRAME_SAMPLES);
+                        for i in 0..samples {
+                            mix_buf[i] += decode_buf[i] as f32 / i16::MAX as f32;
+                        }
                     }
                 }
+
+                if peer_count > 0 {
+                    for s in mix_buf.iter_mut() {
+                        *s = s.clamp(-1.0, 1.0);
+                    }
+
+                    // Resample 48 kHz → device rate if they differ.
+                    let resampled;
+                    let final_samples: &[f32] = if self.device_sample_rate == OPUS_SAMPLE_RATE {
+                        &mix_buf[..]
+                    } else {
+                        resampled = resample(&mix_buf, OPUS_SAMPLE_RATE, self.device_sample_rate);
+                        &resampled[..]
+                    };
+
+                    // Push mono samples; the cpal callback expands to device channels.
+                    let mut producer = self.producer.lock().await;
+                    let written = producer.push_slice(final_samples);
+                    if written < final_samples.len() {
+                        trace!(
+                            "Output ring buffer full, dropped {} samples",
+                            final_samples.len() - written
+                        );
+                    }
+                    drop(producer);
+                    frames_pushed += 1;
+                }
+
+                frames_produced += 1;
+                diag_decoded += 1;
             }
 
             // Evict stale jitter buffers (disconnected peers with no new data).
@@ -699,41 +789,56 @@ impl CpalAudioPlayback {
             drop(decoders);
             drop(buffers);
 
-            if peer_count > 0 {
-                for s in mix_buf.iter_mut() {
-                    *s = s.clamp(-1.0, 1.0);
-                }
-
-                // Resample 48 kHz → device rate if they differ.
-                let output_samples = if self.device_sample_rate == OPUS_SAMPLE_RATE {
-                    mix_buf.clone()
-                } else {
-                    resample(&mix_buf, OPUS_SAMPLE_RATE, self.device_sample_rate)
-                };
-
-                // Push mono samples; the cpal callback expands to device channels.
-                let mut producer = self.producer.lock().await;
-                let written = producer.push_slice(&output_samples);
-                if written < output_samples.len() {
-                    trace!(
-                        "Output ring buffer full, dropped {} samples",
-                        output_samples.len() - written
-                    );
-                }
-                frames_pushed += 1;
-            }
-
-            // Periodic diagnostic log
-            if tick_count % diag_interval == 0 {
+            // Periodic diagnostic log + receiver reports (~every 250 frames = 5s of audio).
+            if diag_decoded >= 250 {
                 info!(
                     frames_decoded,
                     frames_missed,
                     frames_pushed,
+                    produced = frames_produced,
+                    due = frames_due,
                     "Audio playout stats (last 5s)"
                 );
+
+                // Send ReceiverReport for each active peer.
+                let total = frames_decoded + frames_missed;
+                if total > 0 {
+                    let loss_fraction = frames_missed as f32 / total as f32;
+                    let transport = self.transport.lock().await;
+                    let our_id = *self.our_peer_id.lock().await;
+                    if let (Some(ref tx), Some(_our_id)) = (&*transport, our_id) {
+                        let buffers = self.buffers.lock().await;
+                        let peer_ids: Vec<u64> = buffers
+                            .keys()
+                            .map(|(pid, _)| *pid)
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect();
+                        let buf_depth = buffers
+                            .values()
+                            .next()
+                            .map(|jb| jb.buffer.len() as u16)
+                            .unwrap_or(0);
+                        drop(buffers);
+
+                        for pid in peer_ids {
+                            let report = ControlMsg::ReceiverReport {
+                                target_sender_id: PeerId(pid),
+                                loss_fraction,
+                                jitter_ms: 0.0,
+                                buffer_depth: buf_depth,
+                            };
+                            if let Err(e) = tx.send_control(report).await {
+                                trace!("Failed to send ReceiverReport: {e}");
+                            }
+                        }
+                    }
+                }
+
                 frames_decoded = 0;
                 frames_missed = 0;
                 frames_pushed = 0;
+                diag_decoded = 0;
             }
         }
     }

@@ -1,6 +1,6 @@
 //! Managed Tauri state — holds Arc-wrapped adapters and use cases from ballsack-core.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicI32};
 use std::sync::Arc;
 
 use tokio::sync::Mutex;
@@ -12,6 +12,7 @@ use ballsack_core::adapters::media::video::VideoPlaybackAdapter;
 use ballsack_core::adapters::playback::CombinedPlayback;
 use ballsack_core::adapters::quic::client::QuicClientTransport;
 use ballsack_core::adapters::room_state::InMemoryRoomState;
+use ballsack_core::application::bitrate_adapt::{BitrateAdaptUseCase, DEFAULT_BITRATE};
 use ballsack_core::application::handle_control::HandleControlUseCase;
 use ballsack_core::application::join_room::JoinRoomUseCase;
 use ballsack_core::application::key_distribute::KeyDistributeUseCase;
@@ -114,6 +115,12 @@ pub async fn build_call_session(
 
     // Spawn background tasks
 
+    // Shared bitrate target for adaptation (encoder reads, adapter writes).
+    let bitrate_target = Arc::new(AtomicI32::new(DEFAULT_BITRATE));
+
+    // Channel for forwarding receiver reports from control handler → bitrate adapter.
+    let (report_tx, report_rx) = tokio::sync::mpsc::channel(16);
+
     // Control handler (shares key_distribute + shared_key so it can
     // re-distribute the CURRENT key when a new peer joins)
     let handle_control = Arc::new(HandleControlUseCase::new(
@@ -125,6 +132,7 @@ pub async fn build_call_session(
         room_id,
         key_distribute.clone(),
         shared_key.clone(),
+        Some(report_tx),
     ));
     let hc = handle_control.clone();
     tokio::spawn(async move {
@@ -133,8 +141,24 @@ pub async fn build_call_session(
         }
     });
 
+    // Bitrate adaptation controller (AIMD)
+    let bitrate_adapt = BitrateAdaptUseCase::new(
+        transport.clone(),
+        bitrate_target.clone(),
+        report_rx,
+    );
+    tokio::spawn(async move {
+        if let Err(e) = bitrate_adapt.run().await {
+            tracing::error!("Bitrate adapter exited: {e}");
+        }
+    });
+
     // Media receiver — real audio playback via cpal + Opus decoding
     let audio_playback = Arc::new(CpalAudioPlayback::new(10)?);
+    // Attach transport so playout loop can send ReceiverReport messages.
+    audio_playback
+        .set_transport(transport.clone(), our_peer_id)
+        .await;
     audio_playback.start(); // spawns the 20ms playout mixer loop
     let audio_pb_handle = audio_playback.clone(); // kept in CallSession for stop-on-drop
     let video_playback = Arc::new(VideoPlaybackAdapter::new(10));
@@ -170,6 +194,7 @@ pub async fn build_call_session(
     // Real audio capture from microphone via cpal + Opus encoding
     let mut audio_capture = CpalAudioCapture::with_device(input_device.as_deref())?;
     let mute_flag = audio_capture.mute_handle();
+    audio_capture.set_bitrate_target(bitrate_target);
 
     // Audio send loop (reads key from shared_key on each frame)
     let send_media = Arc::new(SendMediaUseCase::new(

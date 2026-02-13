@@ -89,6 +89,18 @@ pub enum ControlMsg {
         bitrate_in: u64,
         bitrate_out: u64,
     },
+
+    // -- Receiver report (sent by receiver → SFU → original sender) --
+    ReceiverReport {
+        /// The peer whose media this report describes.
+        target_sender_id: PeerId,
+        /// Fraction of expected frames that were lost (0.0 – 1.0).
+        loss_fraction: f32,
+        /// Inter-arrival jitter in milliseconds.
+        jitter_ms: f32,
+        /// Current jitter buffer depth (frames).
+        buffer_depth: u16,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +134,7 @@ impl ControlMsg {
             Self::KeyRotate { .. } => 0x21,
             Self::VideoKeyframeRequest { .. } => 0x30,
             Self::StatsReport { .. } => 0x40,
+            Self::ReceiverReport { .. } => 0x41,
         }
     }
 }

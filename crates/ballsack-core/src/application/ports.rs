@@ -34,6 +34,11 @@ pub trait Transport: Send + Sync {
     /// Actively close the connection. Background tasks that are blocked on
     /// `recv_control` / `recv_datagram` will get an error and exit.
     fn close(&self);
+
+    /// Current smoothed RTT of the QUIC path, if available.
+    fn rtt(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------

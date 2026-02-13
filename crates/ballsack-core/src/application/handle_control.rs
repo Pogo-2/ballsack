@@ -4,11 +4,13 @@
 
 use std::sync::Arc;
 
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::domain::control::ControlMsg;
 use crate::domain::identity::{PeerId, RoomId, SharedSenderKey};
 
+use super::bitrate_adapt::ReceiverReportData;
 use super::key_distribute::KeyDistributeUseCase;
 use super::ports::{AppEvents, E2eeKeystore, RoomState, Transport};
 
@@ -23,6 +25,8 @@ pub struct HandleControlUseCase {
     key_distribute: Arc<KeyDistributeUseCase>,
     /// The current sender key used by the media send loop.
     shared_key: SharedSenderKey,
+    /// Channel for forwarding receiver reports to the bitrate adapter.
+    report_tx: Option<mpsc::Sender<ReceiverReportData>>,
 }
 
 impl HandleControlUseCase {
@@ -35,6 +39,7 @@ impl HandleControlUseCase {
         room_id: RoomId,
         key_distribute: Arc<KeyDistributeUseCase>,
         shared_key: SharedSenderKey,
+        report_tx: Option<mpsc::Sender<ReceiverReportData>>,
     ) -> Self {
         Self {
             transport,
@@ -45,6 +50,7 @@ impl HandleControlUseCase {
             room_id,
             key_distribute,
             shared_key,
+            report_tx,
         }
     }
 
@@ -131,6 +137,23 @@ impl HandleControlUseCase {
                 // Will be handled by the media encoder (video adapter).
                 // For now just log.
                 info!("Received VideoKeyframeRequest (not yet handled)");
+            }
+
+            ControlMsg::ReceiverReport {
+                loss_fraction,
+                jitter_ms,
+                buffer_depth,
+                ..
+            } => {
+                if let Some(ref tx) = self.report_tx {
+                    let _ = tx
+                        .try_send(ReceiverReportData {
+                            loss_fraction,
+                            jitter_ms,
+                            buffer_depth,
+                        });
+                }
+                info!(loss_fraction, jitter_ms, buffer_depth, "Received ReceiverReport");
             }
 
             ControlMsg::StatsReport {

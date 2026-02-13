@@ -34,10 +34,13 @@ impl StatsUseCase {
         loop {
             tokio::time::sleep(self.interval).await;
 
-            // In a real implementation, these would come from transport-level metrics.
-            let rtt_ms = 0u32; // TODO: read from transport
-            let loss = 0.0f32;
-            let jitter_ms = 0.0f32;
+            let rtt_ms = self
+                .transport
+                .rtt()
+                .map(|d| d.as_millis() as u32)
+                .unwrap_or(0);
+            let loss = 0.0f32;    // populated by receiver reports
+            let jitter_ms = 0.0f32; // populated by receiver reports
             let bitrate_in = 0u64;
             let bitrate_out = 0u64;
 

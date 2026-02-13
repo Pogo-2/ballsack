@@ -218,6 +218,9 @@ impl SfuServer {
                 }
                 ControlMsg::VideoKeyframeRequest {
                     target_sender_id, ..
+                }
+                | ControlMsg::ReceiverReport {
+                    target_sender_id, ..
                 } => {
                     // Forward to the target peer.
                     self.send_to_peer_in_room(room_id, *target_sender_id, &msg)
