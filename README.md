@@ -1,4 +1,4 @@
-# ballsack
+# RUST VOICE CHAT
 
 **Encrypted group calls that don't phone home.**
 
@@ -166,7 +166,7 @@ This is a working prototype. The plumbing is all there -- QUIC transport, E2EE k
 
 ### What's next
 
-- [ ] Real audio capture/playback (`cpal` + Opus)
+- [X] Real audio capture/playback (`cpal` + Opus)
 - [ ] Real video capture/encode (libvpx or OpenH264)
 - [ ] Ed25519 signatures on key distribution messages
 - [ ] Safety number / fingerprint verification UI
