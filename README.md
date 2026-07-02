@@ -176,10 +176,6 @@ This is a working prototype. The plumbing is all there -- QUIC transport, E2EE k
 
 ---
 
-## Why "ballsack"?
-
-You know why.
-
 ## License
 
 MIT -- do whatever you want with it.
